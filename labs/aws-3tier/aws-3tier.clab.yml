@@ -1,0 +1,100 @@
+# AWS の VPC (Public / Private / Trusted の3サブネット) を物理っぽく再現するラボ
+#
+#   user(インターネット) ── fw(VPCルータ + SG/NACL 役) ─┬─ sw-public  ─ proxy, bastion-pub
+#                                                       ├─ sw-private ─ app,   bastion-db
+#                                                       └─ sw-trusted ─ db
+name: aws-3tier
+
+topology:
+  defaults:
+    kind: linux
+    image: ghcr.io/hellt/network-multitool
+
+  nodes:
+    # ---- インターネット側 ----
+    user:
+      labels: {graph-group: Internet, graph-level: 1}
+      exec:
+        - ip addr add 203.0.113.10/24 dev eth1
+        - ip route add 10.0.0.0/16 via 203.0.113.1
+
+    # ---- VPCルータ兼ファイアウォール (AWS では見えない部分) ----
+    fw:
+      labels: {graph-group: VPC Router, graph-level: 2}
+      binds:
+        - configs/fw.sh:/fw.sh
+      exec:
+        - sh /fw.sh
+
+    # ---- スイッチ (サブネットの実体 = 同じスイッチにつながる範囲) ----
+    sw-public:
+      labels: {graph-group: Public 10.0.1.0/24, graph-level: 3}
+      exec: [ip link add br0 type bridge, ip link set br0 up,
+             ip link set eth1 master br0, ip link set eth2 master br0, ip link set eth3 master br0]
+    sw-private:
+      labels: {graph-group: Private 10.0.2.0/24, graph-level: 3}
+      exec: [ip link add br0 type bridge, ip link set br0 up,
+             ip link set eth1 master br0, ip link set eth2 master br0, ip link set eth3 master br0]
+    sw-trusted:
+      labels: {graph-group: Trusted 10.0.3.0/24, graph-level: 3}
+      exec: [ip link add br0 type bridge, ip link set br0 up,
+             ip link set eth1 master br0, ip link set eth2 master br0]
+
+    # ---- Public subnet ----
+    proxy:
+      image: nginx:1.27-alpine
+      labels: {graph-group: Public 10.0.1.0/24, graph-level: 4}
+      binds:
+        - configs/nginx.conf:/etc/nginx/conf.d/default.conf
+      exec:
+        - ip addr add 10.0.1.10/24 dev eth1
+        - ip route add 10.0.0.0/16 via 10.0.1.1
+        - ip route add 203.0.113.0/24 via 10.0.1.1
+    bastion-pub:
+      # 本物の sshd の代わりに 22番で待ち受けてバナーを返すだけのダミー
+      cmd: socat TCP-LISTEN:22,fork,reuseaddr SYSTEM:'echo SSH-2.0-bastion-pub-dummy'
+      labels: {graph-group: Public 10.0.1.0/24, graph-level: 4}
+      exec:
+        - ip addr add 10.0.1.20/24 dev eth1
+        - ip route add 10.0.0.0/16 via 10.0.1.1
+        - ip route add 203.0.113.0/24 via 10.0.1.1
+
+    # ---- Private subnet ----
+    app:
+      cmd: nginx -g 'daemon off;'
+      labels: {graph-group: Private 10.0.2.0/24, graph-level: 4}
+      exec:
+        - ip addr add 10.0.2.10/24 dev eth1
+        - ip route add 10.0.0.0/16 via 10.0.2.1
+        - ip route add 203.0.113.0/24 via 10.0.2.1
+        - sh -c "echo 'Hello from app server (Private 10.0.2.10)' > /usr/share/nginx/html/index.html"
+    bastion-db:
+      image: postgres:16-alpine
+      cmd: sleep infinity          # psql クライアントとして使うだけ
+      labels: {graph-group: Private 10.0.2.0/24, graph-level: 4}
+      exec:
+        - ip addr add 10.0.2.20/24 dev eth1
+        - ip route add 10.0.0.0/16 via 10.0.2.1
+        - ip route add 203.0.113.0/24 via 10.0.2.1
+
+    # ---- Trusted subnet ----
+    db:
+      image: postgres:16-alpine
+      env:
+        POSTGRES_PASSWORD: secret
+      labels: {graph-group: Trusted 10.0.3.0/24, graph-level: 4}
+      exec:
+        - ip addr add 10.0.3.10/24 dev eth1
+        - ip route add 10.0.0.0/16 via 10.0.3.1
+        - ip route add 203.0.113.0/24 via 10.0.3.1
+
+  links:
+    - endpoints: ["user:eth1", "fw:eth1"]           # インターネット (IGW 相当)
+    - endpoints: ["fw:eth2", "sw-public:eth1"]
+    - endpoints: ["fw:eth3", "sw-private:eth1"]
+    - endpoints: ["fw:eth4", "sw-trusted:eth1"]
+    - endpoints: ["sw-public:eth2", "proxy:eth1"]
+    - endpoints: ["sw-public:eth3", "bastion-pub:eth1"]
+    - endpoints: ["sw-private:eth2", "app:eth1"]
+    - endpoints: ["sw-private:eth3", "bastion-db:eth1"]
+    - endpoints: ["sw-trusted:eth2", "db:eth1"]

@@ -1,0 +1,3 @@
+# containerlab runtime artifacts (contain CA private keys etc.)
+clab-*/
+*.clab.yml.bak
